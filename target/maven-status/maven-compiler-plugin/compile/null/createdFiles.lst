@@ -1,0 +1,8 @@
+com/ember/storage/FileStorageService.class
+com/ember/service/FileProcessingService.class
+com/ember/config/PgpConfig.class
+com/ember/compression/ZipCompressionService.class
+com/ember/encryption/PgpEncryptionService.class
+com/ember/sftp/SftpObjectService.class
+com/ember/sftp/SftpConfig.class
+com/ember/config/PgpConfig$PublicKeyConfig.class
