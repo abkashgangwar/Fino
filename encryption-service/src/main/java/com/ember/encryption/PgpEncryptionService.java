@@ -4,7 +4,6 @@ import com.ember.config.PgpConfig;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import org.bouncycastle.bcpg.ArmoredOutputStream;
 import org.bouncycastle.bcpg.CompressionAlgorithmTags;
 import org.bouncycastle.bcpg.SymmetricKeyAlgorithmTags;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
@@ -16,22 +15,33 @@ import org.jboss.logging.Logger;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
-import java.security.NoSuchProviderException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.Security;
+import java.util.Calendar;
 import java.util.Iterator;
 
 /**
- * Encrypts arbitrary byte payloads using an OpenPGP public key.
+ * Encrypts file payloads using an OpenPGP public key.
  *
  * Settings match the SOP:
  *  - Symmetric cipher: AES-256
  *  - Compression: ZIP
  *  - Integrity check (Modification Detection Code / integrity packet): enabled
+ * <p>
+ * Streams source file -> literal data packet -> ZIP compression -> AES-256 encryption
+ * -> destination file, entirely via chained OutputStreams. Nothing here holds the
+ * whole payload in a byte[] at any point, which is what let large files (100k-row
+ * CSVs, at volume) blow up heap usage under load. The outer encrypted-data layer
+ * uses PGPEncryptedDataGenerator's buffered/partial-length open() overload instead
+ * of the length-prefixed one, since the final compressed size isn't known ahead of
+ * time when streaming.
  */
 @ApplicationScoped
 public class PgpEncryptionService {
 
     private static final Logger LOG = Logger.getLogger(PgpEncryptionService.class);
+    private static final int STREAM_BUFFER_SIZE = 1 << 16; // 64KB
 
     @Inject
     PgpConfig pgpConfig;
@@ -94,62 +104,48 @@ public class PgpEncryptionService {
     }
 
     /**
-     * Encrypts the given plaintext bytes and returns a binary (non-armored) .pgp payload,
-     * compressed with ZIP, encrypted with AES-256, with integrity protection enabled.
+     * Encrypts the given source file and writes a binary (non-armored) .pgp payload
+     * to dest, compressed with ZIP, encrypted with AES-256, with integrity protection
+     * enabled. Streams throughout - source file size can be arbitrarily large without
+     * increasing heap usage.
      *
-     * @param plaintext the raw file content (e.g. CSV bytes)
+     * @param source       the file to encrypt (e.g. the intermediate .zip archive)
+     * @param dest         where to write the resulting .pgp payload
      * @param fileNameHint the literal filename to embed inside the PGP literal data packet
      */
-    public byte[] encrypt(byte[] plaintext, String fileNameHint) throws IOException, PGPException, NoSuchProviderException {
-        ByteArrayOutputStream encryptedOut = new ByteArrayOutputStream();
+    public void encrypt(Path source, Path dest, String fileNameHint) throws IOException, PGPException {
+        long sourceLength = Files.size(source);
 
-        // 1. Compress the plaintext (ZIP) into a literal data packet, in-memory.
-        byte[] compressedLiteral = compressToLiteralData(plaintext, fileNameHint);
+        try (OutputStream fileOut = new BufferedOutputStream(Files.newOutputStream(dest), STREAM_BUFFER_SIZE)) {
+            JcePGPDataEncryptorBuilder encryptorBuilder =
+                    new JcePGPDataEncryptorBuilder(SymmetricKeyAlgorithmTags.AES_256)
+                            .setWithIntegrityPacket(true)
+                            .setSecureRandom(new java.security.SecureRandom())
+                            .setProvider("BC");
 
-        // 2. Set up the encrypted data generator: AES-256, integrity packet enabled.
-        JcePGPDataEncryptorBuilder encryptorBuilder =
-                new JcePGPDataEncryptorBuilder(SymmetricKeyAlgorithmTags.AES_256)
-                        .setWithIntegrityPacket(true)
-                        .setSecureRandom(new java.security.SecureRandom())
-                        .setProvider("BC");
+            PGPEncryptedDataGenerator encryptedDataGenerator = new PGPEncryptedDataGenerator(encryptorBuilder);
+            encryptedDataGenerator.addMethod(
+                    new JcePublicKeyKeyEncryptionMethodGenerator(encryptionKey).setProvider("BC"));
 
-        PGPEncryptedDataGenerator encryptedDataGenerator = new PGPEncryptedDataGenerator(encryptorBuilder);
-        encryptedDataGenerator.addMethod(
-                new JcePublicKeyKeyEncryptionMethodGenerator(encryptionKey).setProvider("BC"));
-
-        try (OutputStream cipherOut = encryptedDataGenerator.open(encryptedOut, compressedLiteral.length)) {
-            cipherOut.write(compressedLiteral);
-        }
-
-        return encryptedOut.toByteArray();
-    }
-
-    /** Same as {@link #encrypt}, but wraps the result in ASCII armor (base64 text) instead of raw binary. */
-    public byte[] encryptArmored(byte[] plaintext, String fileNameHint) throws IOException, PGPException, NoSuchProviderException {
-        ByteArrayOutputStream armoredOut = new ByteArrayOutputStream();
-        try (ArmoredOutputStream armored = new ArmoredOutputStream(armoredOut)) {
-            byte[] binary = encrypt(plaintext, fileNameHint);
-            armored.write(binary);
-        }
-        return armoredOut.toByteArray();
-    }
-
-    private byte[] compressToLiteralData(byte[] plaintext, String fileName) throws IOException {
-        ByteArrayOutputStream compressedOut = new ByteArrayOutputStream();
-        PGPCompressedDataGenerator compressedDataGenerator =
-                new PGPCompressedDataGenerator(CompressionAlgorithmTags.ZIP);
-
-        try (OutputStream compressorStream = compressedDataGenerator.open(compressedOut)) {
-            PGPLiteralDataGenerator literalDataGenerator = new PGPLiteralDataGenerator();
-            try (OutputStream literalOut = literalDataGenerator.open(
-                    compressorStream,
-                    PGPLiteralData.BINARY,
-                    fileName,
-                    plaintext.length,
-                    java.util.Calendar.getInstance().getTime())) {
-                literalOut.write(plaintext);
+            // Buffered/partial-length overload: we don't know the final compressed size
+            // ahead of time when streaming, so this writes partial-length packets instead
+            // of requiring a pre-known total length.
+            try (OutputStream cipherOut = encryptedDataGenerator.open(fileOut, new byte[STREAM_BUFFER_SIZE])) {
+                PGPCompressedDataGenerator compressedDataGenerator =
+                        new PGPCompressedDataGenerator(CompressionAlgorithmTags.ZIP);
+                try (OutputStream compressorStream = compressedDataGenerator.open(cipherOut, new byte[STREAM_BUFFER_SIZE])) {
+                    PGPLiteralDataGenerator literalDataGenerator = new PGPLiteralDataGenerator();
+                    try (OutputStream literalOut = literalDataGenerator.open(
+                            compressorStream,
+                            PGPLiteralData.BINARY,
+                            fileNameHint,
+                            sourceLength,
+                            Calendar.getInstance().getTime());
+                         InputStream sourceIn = new BufferedInputStream(Files.newInputStream(source), STREAM_BUFFER_SIZE)) {
+                        sourceIn.transferTo(literalOut);
+                    }
+                }
             }
         }
-        return compressedOut.toByteArray();
     }
 }

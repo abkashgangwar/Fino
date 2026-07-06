@@ -8,28 +8,110 @@ archive (AES-256, integrity packet enabled), and writes the result to an
 ## How it works
 
 1. `FileProcessingService` polls the SFTP input directory on a cron schedule
-   (`app.poll.cron`, default every 5 minutes).
-2. For every file found, it:
-   - downloads the file (`SftpObjectService.downloadFromInput`)
-   - wraps it into a standalone `.zip` archive (`ZipCompressionService.zip`)
-   - PGP-encrypts the zip archive with the configured public key
+   (`app.poll.cron`, default every 10 seconds), with `concurrentExecution = SKIP`
+   so a slow poll cycle over a big backlog can never overlap with the next tick.
+2. Each poll cycle processes up to `app.processing.parallelism` files concurrently
+   (default 8). For every file:
+   - downloads the file straight to a local temp file (`SftpObjectService.downloadFromInput`)
+   - wraps it into a standalone `.zip` archive, streamed file-to-file (`ZipCompressionService.zip`)
+   - PGP-encrypts the zip archive with the configured public key, streamed file-to-file
      (`PgpEncryptionService.encrypt`)
-   - uploads `<name>.zip.pgp` to the SFTP output directory
-   - deletes the source file from the input directory so it isn't re-processed.
+   - uploads `<name>.zip.pgp` to the SFTP output directory, streamed from the temp file
+   - **moves the source file into `<input-dir>/done/`** - it is never deleted, only
+     relocated, once its encrypted output is safely uploaded.
 
-   e.g. `testing.csv` → `testing.csv.zip` (in memory) → `testing.csv.zip.pgp` (uploaded)
+   e.g. `testing.csv` → `testing.csv.zip` (temp file) → `testing.csv.zip.pgp` (uploaded),
+   then `testing.csv` → `done/testing.csv` (renamed in place).
+
+   Every stage streams through fixed-size buffers rather than buffering the whole
+   file in a `byte[]`, so file size no longer drives JVM heap usage - only local
+   disk space in the OS temp directory, which is cleaned up per file as soon as
+   it's processed.
+
+> **Idempotency, since input files are never deleted:** a fully-processed source
+> file is renamed into an input-side `done/` sub-directory (`FileStorageService.moveToDone`)
+> right after its output uploads successfully. `listInputObjects()` lists the input
+> directory non-recursively, so anything already in `done/` simply never appears in
+> future polls again - no output-directory lookup needed per file.
+>
+> This replaced an earlier approach that checked whether `<name>.zip.pgp` already
+> existed in the output directory (`existsInProcessed`) for every input file, every
+> poll cycle. That's a single SFTP round-trip per file - fine at low volume, but
+> since input files are never deleted, the backlog of "already done, just checking"
+> files only ever grew. At 100,000+ files that alone could add minutes of pure
+> existence-checking to every cycle, before any real work even started. Moving a
+> file out of the pending listing instead of just checking it against the output
+> means each poll only ever sees genuinely-pending work - the check overhead no
+> longer grows with how many files have been processed over the service's lifetime.
 
 > Note: PGP itself also applies its own internal OpenPGP ZIP compression on
 > whatever bytes it encrypts (per the original SOP). Since the payload is
 > already a `.zip` at that point, this second compression pass won't shrink
-> it much further — it's harmless, just slightly redundant. If you want to
-> avoid double-compression, set `CompressionAlgorithmTags.UNCOMPRESSED` in
-> `PgpEncryptionService` instead.
+> it much further — it's a real (if modest) CPU cost with no size benefit at
+> volume, but it's left enabled intentionally here since `pgp.compression=ZIP`
+> is an SOP-mandated setting, not just a technical default. If that constraint
+> ever changes, switch it to `CompressionAlgorithmTags.UNCOMPRESSED` in
+> `PgpEncryptionService` to skip the redundant pass.
 
 > Polling is simple and reliable for low-medium volume. For high volume or
 > low latency, an event-driven trigger (e.g. an inotify watcher or a webhook
 > from whatever drops files onto the SFTP server) could replace the
 > `@Scheduled` poller — the encryption/upload logic underneath stays the same.
+
+## Why the service was falling over under load (2000 files / 100k rows)
+
+Two compounding bugs, both fixed above:
+
+1. **Overlapping poll cycles racing the same SFTP channel.** The old
+   `@Scheduled` annotation never set `concurrentExecution`, so it defaulted to
+   Quarkus's `PROCEED` (overlapping runs allowed) despite a comment in the code
+   claiming otherwise. A poll cycle over a large backlog easily runs longer than
+   the cron interval, so the next tick started a second `pollAndProcess()` call
+   while the first was still running - and JSch's `ChannelSftp` is **not**
+   thread-safe, so two calls sharing one channel corrupted its state. Fixed with
+   `concurrentExecution = Scheduled.ConcurrentExecution.SKIP` plus a per-poll
+   SFTP connection pool so parallel workers never share a channel either.
+2. **Everything buffered fully in memory.** `download → zip → encrypt` each
+   produced a brand-new full-size `byte[]`, so a single large file could be
+   resident in heap 3-4 times over, with no `-Xmx` tuning to absorb it. At
+   2000 files this reliably exhausted the heap. Fixed by staging each file
+   through local temp files and streaming every stage (SFTP transfer, ZIP,
+   PGP) via fixed 64KB buffers instead.
+
+## Scaling further: 100,000+ files
+
+The two fixes above make a single poll cycle safe and heap-independent, but at
+much larger backlogs (e.g. 100,000 files) a third issue shows up: the
+idempotency check itself.
+
+- **Old behavior:** every input file, every poll cycle, triggered an SFTP
+  `lstat` against the output directory (`existsInProcessed`) just to confirm
+  "have I already done this one?" Since input files are never deleted, that
+  backlog of already-processed-but-still-listed files only ever grew. At
+  100,000 files this alone could add minutes of pure existence-checking to
+  every cycle, before any real work started - and it would only get worse
+  over the service's lifetime.
+- **Fixed by:** moving a file into an input-side `done/` sub-directory
+  (`FileStorageService.moveToDone`, a metadata-only SFTP rename) right after
+  its output is successfully uploaded, instead of just checking it against the
+  output. `listInputObjects()` is a non-recursive listing of the input
+  directory, so anything already in `done/` never appears in it again. Each
+  poll cycle now only ever sees genuinely-pending work - the per-cycle listing
+  cost is bounded by the current backlog, not by how many files have *ever*
+  been processed.
+
+One resulting batch-size nuance worth knowing: `pollAndProcess()` submits the
+*entire* pending list to the worker pool and blocks (`future.get()` in a loop)
+until every one of them finishes before returning - which is what lets
+`concurrentExecution = SKIP` guarantee no overlap. So a single very large batch
+(e.g. all 100,000 files pending at once) runs as one long cycle bounded by
+`app.processing.parallelism`, not `app.poll.cron` - the cron interval only
+governs the gap *between* cycles, not how long one cycle is allowed to take.
+Any file still mid-flight (or not yet picked up) if the process crashes simply
+stays visible to the next cycle's `listInputObjects()` call, since it's only
+moved to `done/` after a fully successful upload - so at most the one file that
+was actually in flight gets reprocessed, nothing is ever lost or silently
+skipped.
 
 ## Project layout
 
@@ -38,7 +120,7 @@ src/main/java/com/ember/
 ├── config/
 │   └── PgpConfig.java              # type-safe mapping of pgp.* properties
 ├── storage/
-│   └── FileStorageService.java     # backend interface (list/download/upload/delete)
+│   └── FileStorageService.java     # backend interface (list/download/upload/moveToDone/delete)
 ├── sftp/
 │   ├── SftpConfig.java             # type-safe mapping of sftp.* properties
 │   └── SftpObjectService.java      # FileStorageService impl backed by SFTP (JSch)
@@ -64,12 +146,51 @@ sftp.username=${SFTP_USERNAME:testuser}
 sftp.password=${SFTP_PASSWORD:testpass}
 sftp.input-dir=${SFTP_INPUT_DIR:/upload/input}
 sftp.output-dir=${SFTP_OUTPUT_DIR:/upload/output}
+sftp.pool-size=${SFTP_POOL_SIZE:8}
+sftp.bulk-requests=${SFTP_BULK_REQUESTS:64}
 ```
+
+`sftp.pool-size` controls how many concurrent SFTP session/channel pairs are kept
+ready for use - keep it `>= app.processing.parallelism` (see below) so every
+concurrent file-processing worker can always get its own connection.
+
+`sftp.bulk-requests` controls JSch's request-pipelining depth per channel (how
+many SFTP read/write requests can be in flight, unacknowledged, at once). JSch's
+own default is a conservative 16 - fine on localhost, but on any link with real
+round-trip latency that caps large-file transfer throughput well below what the
+link can actually do, since each in-flight slot is what lets the next chunk go
+out before the previous one's ack comes back. 64 here is a reasonable starting
+point for large files at volume; lower it if a particular SFTP server pushes
+back on high concurrency.
+
+## Processing configuration
+
+```properties
+app.poll.cron=${APP_POLL_CRON:*/10 * * * * ?}
+app.processing.parallelism=${APP_PROCESSING_PARALLELISM:8}
+```
+
+`app.processing.parallelism` is how many files are encrypted/uploaded concurrently
+within a single poll cycle. Raise it (together with `sftp.pool-size`) to push
+through a large backlog faster; each worker holds only small fixed-size buffers
+in memory, not full file contents, so raising this scales with CPU/network
+capacity rather than heap.
 
 Defaults above match the local SFTP server in `docker-compose.yml`. For a
 real server, override via env vars (`SFTP_HOST`, `SFTP_PORT`, etc.) or a
 private key instead of a password — `SftpConfig` also supports
 `sftp.private-key-path` for key-based auth.
+
+**Tuning for a very large backlog (e.g. 100,000+ files):** the two levers
+that actually move the needle are `app.processing.parallelism` and
+`sftp.pool-size` (always raise them together - the pool must have at least
+as many connections as there are concurrent workers). The defaults (8/8) are
+deliberately conservative so the service is safe out of the box; the right
+higher value depends on your real SFTP server's concurrent-session limit,
+network bandwidth, and available CPU (PGP/AES-256 encryption is CPU-bound).
+There's no single safe number to recommend blindly - raise both gradually
+(e.g. 8 → 16 → 32) while watching CPU, network throughput, and the SFTP
+server's own load, rather than jumping straight to a large value.
 
 ## PGP key configuration (never hardcoded)
 
@@ -133,7 +254,8 @@ cp .env.example .env   # .env is gitignored; .env.example is the committed templ
    cp testing.csv ./sftp-data/input/
    ```
    Within ~5 minutes, `testing.csv.zip.pgp` should appear in `./sftp-data/output/`,
-   and the source file should be gone from `./sftp-data/input/`.
+   and `testing.csv` should be moved from `./sftp-data/input/` into
+   `./sftp-data/input/done/` (not deleted).
 
 ## Testing decryption (sanity check)
 
@@ -149,29 +271,47 @@ cat testing.csv
 
 ## Failure behavior
 
-- **Upload fails after encryption succeeds:** the source file is only
-  deleted *after* a successful upload, so it's left in place in the input
-  directory and retried on the next poll cycle. Nothing is lost — the
-  already-encrypted bytes are just discarded from memory and re-produced
-  on retry.
-- **Encryption fails:** same as above — the source file stays untouched
-  and is retried next cycle. Note there's currently no backoff or
-  dead-letter handling, so a file that *always* fails (not a transient
-  issue) will keep retrying and logging an error every poll cycle
-  indefinitely.
+- **Source files are never deleted.** They stay in the input directory
+  indefinitely for audit/retry purposes - either directly in the input
+  directory (still pending) or under `done/` (fully processed). The move
+  into `done/` (see above) is what stops a successfully-processed file from
+  being re-encrypted on the next poll — it does *not* stop retries for a
+  file that hasn't produced output yet, since it only happens after upload
+  succeeds.
+- **Upload or encryption fails:** since nothing is deleted, the file is
+  automatically retried on the next poll cycle. There's deliberately no
+  in-cycle retry/backoff for a single file: at this scale, a systemic issue
+  (e.g. the SFTP server going unreachable) would hit many files at once, and
+  retrying each one individually - each with its own connection-timeout wait -
+  would multiply how long the *whole* batch takes to fail through, which
+  under `concurrentExecution = SKIP` directly delays how soon the next poll
+  cycle (a cheaper, natural retry) can even start. Failing fast per file and
+  letting the next cycle handle it is the safer default at this scale. There's
+  also no cross-cycle backoff or dead-letter handling, so a file that
+  *always* fails (not a transient issue) will keep retrying and logging an
+  error every poll cycle indefinitely.
 - **Public key missing/invalid:** checked once at startup, not per file —
   the whole application fails to start rather than failing per file.
+- **SFTP pool exhausted:** if all `sftp.pool-size` connections are busy for
+  more than 30s, a borrow times out with a clear `IllegalStateException`
+  rather than hanging forever — that file fails and retries next cycle;
+  consider raising `sftp.pool-size` if this happens often.
 
 ## Extending
 
 - **Signing**: add a `PGPSignatureGenerator` step in `PgpEncryptionService`
   using a service-held private key before/with the literal data packet, if
   sender authentication is ever required downstream.
-- **Large files**: current implementation buffers whole files in memory
-  (fine for CSV-sized payloads). For large files, switch
-  `SftpObjectService`/`PgpEncryptionService` to streaming — JSch's
-  `ChannelSftp.get/put` and the PGP generator both support streaming; this
-  is mostly a refactor of method signatures from `byte[]` to `InputStream`.
+- **Retention/cleanup of old `done/` files**: processed files are kept
+  forever under `done/`, not deleted. If that directory grows large enough
+  to matter (millions of entries over the service's lifetime), consider a
+  separate scheduled job that purges `done/` entries older than N days —
+  `FileStorageService.deleteFromInput` is still on the interface for exactly
+  this kind of use, just no longer called from the main pipeline.
+- **Sharding `done/` (and `input/`) by date**: if a single flat directory
+  ever grows large enough that even a non-recursive `ls` gets slow on your
+  SFTP server, consider partitioning by date (e.g. `input/2026/07/04/`) so
+  no single directory's listing grows unbounded.
 - **Event-driven instead of polling**: replace the `@Scheduled` poller with
   a filesystem watch (if the SFTP server's storage is locally accessible)
   or a webhook triggered by whatever process drops files onto the server.
