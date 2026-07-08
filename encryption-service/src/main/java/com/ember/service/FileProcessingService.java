@@ -35,11 +35,29 @@ public class FileProcessingService {
     PgpEncryptionService pgpEncryptionService;
 
     /**
-     * How many files are processed concurrently per poll cycle. Keep this <=
-     * sftp.pool-size so every worker can always get its own SFTP connection.
+     * How many files are processed concurrently per poll cycle. Keep sftp.pool-size
+     * >= this value - each worker needs one read connection and (when streaming is on)
+     * one write connection at once too - see SftpObjectService's two-pool setup.
      */
     @ConfigProperty(name = "app.processing.parallelism", defaultValue = "8")
     int parallelism;
+
+    /**
+     * Switches the whole pipeline between two transfer strategies, with no code change
+     * required - just this one property (accepts true/false or yes/no):
+     * <ul>
+     *   <li>{@code false} (default): file-based. Each file is downloaded to a local temp
+     *       file, zipped to another temp file, PGP-encrypted to a third temp file, then
+     *       uploaded - straightforward to reason about and debug, at the cost of local
+     *       disk I/O per file.</li>
+     *   <li>{@code true}: fully streamed. Bytes flow SFTP-in -> zip -> PGP -> SFTP-out
+     *       in fixed-size chunks with nothing ever touching local disk - lower latency
+     *       and zero local disk footprint, at the cost of needing two SFTP connections
+     *       held open per in-flight file (see SftpObjectService).</li>
+     * </ul>
+     */
+    @ConfigProperty(name = "app.processing.streaming-enabled", defaultValue = "false")
+    boolean streamingEnabled;
 
     private ExecutorService workerPool;
     private Path tempDir;
@@ -48,8 +66,12 @@ public class FileProcessingService {
         try {
             fileStorageService.initialize();
             workerPool = Executors.newFixedThreadPool(Math.max(1, parallelism));
-            tempDir = Files.createTempDirectory("ember-encryption-work-");
-            LOG.infof("Encryption service started (parallelism=%d). Watching input location...", parallelism);
+            if (!streamingEnabled) {
+                // Only the file-based pipeline needs local scratch space.
+                tempDir = Files.createTempDirectory("ember-encryption-work-");
+            }
+            LOG.infof("Encryption service started (parallelism=%d, streaming-enabled=%b). Watching input location...",
+                    parallelism, streamingEnabled);
         } catch (Exception e) {
             throw new IllegalStateException("Failed to initialize storage backend on startup", e);
         }
@@ -65,7 +87,8 @@ public class FileProcessingService {
      * Polls the input location on a cron schedule (configurable via app.poll.cron).
      * For each file found: download -> ZIP-compress -> PGP-encrypt (AES-256, integrity packet)
      * -> upload as <original-name>.zip.pgp to the processed location -> move the source
-     * into an input-side "done" sub-location.
+     * into an input-side "done" sub-location. (Or, when app.processing.streaming-enabled
+     * is true, the streamed equivalent of the same four steps - see {@link #processOne}.)
      * <p>
      * The source file is never deleted, only relocated once fully processed -
      * {@link FileStorageService#moveToDone} is what stops a file from being re-processed
@@ -101,7 +124,8 @@ public class FileProcessingService {
             return;
         }
 
-        LOG.infof("Found %d object(s) in input location to process (parallelism=%d)", objectKeys.size(), parallelism);
+        LOG.infof("Found %d object(s) in input location to process (parallelism=%d, streaming-enabled=%b)",
+                objectKeys.size(), parallelism, streamingEnabled);
 
         List<Future<?>> futures = new ArrayList<>(objectKeys.size());
         for (String key : objectKeys) {
@@ -141,17 +165,28 @@ public class FileProcessingService {
     }
 
     private void processOne(String objectKey) throws Exception {
+        if (streamingEnabled) {
+            processOneStreamed(objectKey);
+        } else {
+            processOneFileBased(objectKey);
+        }
+    }
+
+    /**
+     * File-based path (app.processing.streaming-enabled=false): stage everything
+     * through local temp files instead of byte[] buffers or live streams, so a
+     * large file (e.g. 100k CSV rows) never needs to sit fully in JVM heap, while
+     * keeping each stage's I/O simple and independently retryable/debuggable.
+     */
+    private void processOneFileBased(String objectKey) throws Exception {
         String baseFileName = objectKey.substring(objectKey.lastIndexOf('/') + 1);
         String outputKey = objectKey + ZIP_EXTENSION + PGP_EXTENSION; // e.g. testing.csv -> testing.csv.zip.pgp
 
         // No per-file "is this already done?" check anymore - listInputObjects() only ever
         // returns files that haven't been moved to "done" yet, so reaching this point at all
         // already means the file is genuinely pending. See moveToDone() below.
-        LOG.infof("Processing '%s'...", objectKey);
+        LOG.infof("Processing '%s' (file-based)...", objectKey);
 
-        // Stage everything through local temp files instead of byte[] buffers, so a
-        // large file (e.g. 100k CSV rows) never needs to sit fully in JVM heap. Each
-        // stage streams from the previous stage's file straight to the next one.
         Path rawFile = Files.createTempFile(tempDir, "raw-", "-" + safeSuffix(baseFileName));
         Path zipFile = Files.createTempFile(tempDir, "zip-", ".zip");
         Path encFile = Files.createTempFile(tempDir, "enc-", ".pgp");
@@ -184,6 +219,39 @@ public class FileProcessingService {
             deleteQuietly(zipFile);
             deleteQuietly(encFile);
         }
+    }
+
+    /**
+     * Streamed path (app.processing.streaming-enabled=true): fileStorageService.streamProcess
+     * opens a live SFTP download stream and a live SFTP upload stream at the same time and
+     * hands both to this lambda. From there it's just chained OutputStreams - zip writes
+     * straight into the PGP layer's literal-data stream, which writes straight into the SFTP
+     * upload stream - so bytes flow input -> zip -> pgp -> output in fixed-size chunks
+     * without ever touching local disk.
+     */
+    private void processOneStreamed(String objectKey) throws Exception {
+        String baseFileName = objectKey.substring(objectKey.lastIndexOf('/') + 1);
+        String outputKey = objectKey + ZIP_EXTENSION + PGP_EXTENSION; // e.g. testing.csv -> testing.csv.zip.pgp
+
+        LOG.infof("Processing '%s' (streamed)...", objectKey);
+        long startNanos = System.nanoTime();
+
+        fileStorageService.streamProcess(objectKey, outputKey, (remoteIn, remoteOut) ->
+                pgpEncryptionService.encrypt(remoteOut, baseFileName + ZIP_EXTENSION,
+                        literalOut -> zipCompressionService.zip(remoteIn, literalOut, baseFileName)));
+
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+        LOG.infof("Streamed, zipped & encrypted '%s' -> '%s' in %d ms (no local staging)",
+                objectKey, outputKey, elapsedMs);
+
+        // Only now, after the encrypted output is safely uploaded, relocate the source
+        // out of the pending listing. If anything above fails or the process dies first,
+        // this line never runs, the source stays exactly where listInputObjects() will
+        // find it again, and the file is simply retried next cycle - never lost, never
+        // silently skipped.
+        fileStorageService.moveToDone(objectKey);
+
+        LOG.infof("Source '%s' moved to done/.", objectKey);
     }
 
     private static String safeSuffix(String fileName) {

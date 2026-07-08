@@ -29,13 +29,19 @@ import java.util.Iterator;
  *  - Compression: ZIP
  *  - Integrity check (Modification Detection Code / integrity packet): enabled
  * <p>
- * Streams source file -> literal data packet -> ZIP compression -> AES-256 encryption
- * -> destination file, entirely via chained OutputStreams. Nothing here holds the
- * whole payload in a byte[] at any point, which is what let large files (100k-row
- * CSVs, at volume) blow up heap usage under load. The outer encrypted-data layer
- * uses PGPEncryptedDataGenerator's buffered/partial-length open() overload instead
- * of the length-prefixed one, since the final compressed size isn't known ahead of
- * time when streaming.
+ * Exposes two overloads so the same service backs both pipeline modes (toggled via
+ * {@code app.processing.streaming-enabled} in {@code FileProcessingService}):
+ * <ul>
+ *   <li>{@link #encrypt(Path, Path, String)} - file-based: streams source file ->
+ *       literal data packet -> ZIP compression -> AES-256 encryption -> destination
+ *       file. Used by the non-streaming pipeline.</li>
+ *   <li>{@link #encrypt(OutputStream, String, PlaintextWriter)} - fully streamed: the
+ *       plaintext itself is supplied by a caller-provided callback instead of a source
+ *       file, so nothing here ever touches local disk. Used by the streaming pipeline.</li>
+ * </ul>
+ * Neither overload holds the whole payload in a byte[] at any point - both stream in
+ * fixed-size chunks throughout, which is what lets large files (100k-row CSVs, at
+ * volume) avoid blowing up heap usage under load.
  */
 @ApplicationScoped
 public class PgpEncryptionService {
@@ -107,7 +113,7 @@ public class PgpEncryptionService {
      * Encrypts the given source file and writes a binary (non-armored) .pgp payload
      * to dest, compressed with ZIP, encrypted with AES-256, with integrity protection
      * enabled. Streams throughout - source file size can be arbitrarily large without
-     * increasing heap usage.
+     * increasing heap usage. Used by the file-based (non-streaming) pipeline.
      *
      * @param source       the file to encrypt (e.g. the intermediate .zip archive)
      * @param dest         where to write the resulting .pgp payload
@@ -147,5 +153,78 @@ public class PgpEncryptionService {
                 }
             }
         }
+    }
+
+    /** Supplies the plaintext bytes that go inside the PGP literal data packet. */
+    @FunctionalInterface
+    public interface PlaintextWriter {
+        void writeTo(OutputStream literalDataOut) throws IOException;
+    }
+
+    /**
+     * Streams a binary (non-armored) .pgp payload straight into {@code destination},
+     * compressed with ZIP, encrypted with AES-256, with integrity protection enabled -
+     * calling {@code plaintextWriter} to supply the content that goes inside the PGP
+     * literal data packet (typically the zip step, writing straight into this method's
+     * innermost stream). Nothing here is staged to local disk or buffered fully in
+     * memory - only fixed-size chunks (STREAM_BUFFER_SIZE) move through at a time,
+     * however large the plaintext turns out to be. Used by the streaming pipeline.
+     * <p>
+     * Because there's no intermediate .zip file to call Files.size() on ahead of time,
+     * all three layers here - encryption, compression, and the literal data packet
+     * itself - use their buffered/partial-length open() overloads instead of a
+     * length-prefixed one, so none of them need to know the final size upfront.
+     * <p>
+     * {@code destination} is flushed but deliberately left open on return - the caller
+     * (the SFTP upload stream) owns closing the actual transport once this returns, so
+     * the remote file is only finalized after this method's framing is fully written.
+     *
+     * @param destination     where the encrypted PGP payload is streamed to (e.g. an SFTP upload stream)
+     * @param fileNameHint    the literal filename to embed inside the PGP literal data packet
+     * @param plaintextWriter callback that writes the plaintext (e.g. zipped bytes) into the pipeline
+     */
+    public void encrypt(OutputStream destination, String fileNameHint, PlaintextWriter plaintextWriter)
+            throws IOException, PGPException {
+        OutputStream fileOut = new BufferedOutputStream(destination, STREAM_BUFFER_SIZE);
+
+        JcePGPDataEncryptorBuilder encryptorBuilder =
+                new JcePGPDataEncryptorBuilder(SymmetricKeyAlgorithmTags.AES_256)
+                        .setWithIntegrityPacket(true)
+                        .setSecureRandom(new java.security.SecureRandom())
+                        .setProvider("BC");
+
+        PGPEncryptedDataGenerator encryptedDataGenerator = new PGPEncryptedDataGenerator(encryptorBuilder);
+        encryptedDataGenerator.addMethod(
+                new JcePublicKeyKeyEncryptionMethodGenerator(encryptionKey).setProvider("BC"));
+
+        // Buffered/partial-length overload: we don't know the final compressed size
+        // ahead of time when streaming - this writes partial-length packets instead
+        // of requiring a pre-known total length.
+        //
+        // IMPORTANT: each of these three open() calls gets its OWN fresh byte[], never
+        // a shared one. Each layer uses its buffer internally to accumulate a partial
+        // packet before flushing it to the stream below - since all three layers are
+        // nested and active at once here, sharing one array between them would mean
+        // one layer's in-progress accumulation gets clobbered by another layer writing
+        // through the same memory. Three small arrays is a non-issue memory-wise; a
+        // shared one would be a real (and hard to notice) data-corruption bug.
+        try (OutputStream cipherOut = encryptedDataGenerator.open(fileOut, new byte[STREAM_BUFFER_SIZE])) {
+            PGPCompressedDataGenerator compressedDataGenerator =
+                    new PGPCompressedDataGenerator(CompressionAlgorithmTags.ZIP);
+            try (OutputStream compressorStream = compressedDataGenerator.open(cipherOut, new byte[STREAM_BUFFER_SIZE])) {
+                PGPLiteralDataGenerator literalDataGenerator = new PGPLiteralDataGenerator();
+                // Buffered overload (out, format, name, modTime, buffer) - unlike the
+                // file-based version, the plaintext length isn't known ahead of time here.
+                try (OutputStream literalOut = literalDataGenerator.open(
+                        compressorStream,
+                        PGPLiteralData.BINARY,
+                        fileNameHint,
+                        Calendar.getInstance().getTime(),
+                        new byte[STREAM_BUFFER_SIZE])) {
+                    plaintextWriter.writeTo(literalOut);
+                }
+            }
+        }
+        fileOut.flush();
     }
 }

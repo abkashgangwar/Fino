@@ -1,5 +1,7 @@
 package com.ember.storage;
 
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -12,8 +14,15 @@ import java.util.List;
  * (e.g. {@code @InjectMock FileStorageService}) without dragging in a real SFTP
  * connection.
  * <p>
- * All transfer methods are file-based (not byte[]-based) so that large payloads are
- * streamed straight to/from local disk instead of being held fully in JVM heap.
+ * Exposes BOTH transfer styles so the pipeline mode is a runtime config toggle
+ * (see {@code app.processing.streaming-enabled}) rather than a code fork:
+ * <ul>
+ *   <li>File-based: {@link #downloadFromInput} / {@link #uploadToProcessed} stream
+ *       to/from a local temp file - used when streaming mode is OFF.</li>
+ *   <li>Fully streamed: {@link #streamProcess} bridges a live input stream straight
+ *       to a live output stream with nothing ever touching local disk - used when
+ *       streaming mode is ON.</li>
+ * </ul>
  * <p>
  * Idempotency at scale: the pipeline no longer checks the output location per file
  * (see {@link #moveToDone}) - that used to mean one extra round-trip per file, every
@@ -35,11 +44,42 @@ public interface FileStorageService {
      */
     List<String> listInputObjects() throws Exception;
 
-    /** Streams the named input file straight to the given local destination path. */
+    /**
+     * Streams the named input file straight to the given local destination path.
+     * Used by the file-based (non-streaming) pipeline.
+     */
     void downloadFromInput(String key, Path destination) throws Exception;
 
-    /** Streams the given local file to the output location under the given name. */
+    /**
+     * Streams the given local file to the output location under the given name.
+     * Used by the file-based (non-streaming) pipeline.
+     */
     void uploadToProcessed(String key, Path source) throws Exception;
+
+    /**
+     * Opens the input file at {@code inputKey} for reading and the output file at
+     * {@code outputKey} for writing - both as live remote streams, no local file in
+     * between - and hands both to {@code transform} to bridge them. Used by the
+     * fully-streamed pipeline.
+     * <p>
+     * Needs two SFTP connections held open at once per call (one for the read side,
+     * one for the write side), since a single JSch {@code ChannelSftp} channel isn't
+     * meant to have an in-progress get() and put() interleaved on it. See
+     * {@code SftpObjectService}'s two-pool setup for how that's handled without
+     * risking deadlock.
+     * <p>
+     * If {@code transform} throws, whatever partial bytes made it to the output
+     * location are best-effort deleted, so a half-written {@code .zip.pgp} can never
+     * be mistaken for a complete, valid one - the source file simply stays pending
+     * and is retried on the next poll cycle, same as any other failure.
+     */
+    void streamProcess(String inputKey, String outputKey, StreamTransform transform) throws Exception;
+
+    /** Bridges a live input stream to a live output stream (e.g. zip + PGP-encrypt in between). */
+    @FunctionalInterface
+    interface StreamTransform {
+        void transform(InputStream in, OutputStream out) throws Exception;
+    }
 
     /**
      * Relocates a fully-processed source file, in place, out of the top-level input
