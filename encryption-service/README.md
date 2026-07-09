@@ -269,6 +269,17 @@ unzip -p testing.csv.zip > testing.csv
 cat testing.csv
 ```
 
+## Functional tests (Robot Framework)
+
+`src/test/robot/` has an end-to-end functional suite that starts the real
+packaged service with a dedicated **`test` Quarkus profile** active
+(`%test.*` properties at the bottom of `application.properties` - own poll
+cadence, own HTTP port, etc.), drops a file into the SFTP input directory,
+and asserts the encrypted output lands in the output directory with the
+source moved to `done/`. See `src/test/robot/README.md` for setup and how
+to run it.
+
+
 ## Failure behavior
 
 - **Source files are never deleted.** They stay in the input directory
