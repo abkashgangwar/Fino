@@ -32,7 +32,8 @@ src/test/robot/
 # 1. Python deps for Robot Framework + its SSH library
 pip install -r src/test/robot/requirements.txt
 
-# 2. Local test SFTP server (same one used for manual/dev testing)
+# 2. Local test SFTP servers - input AND output are now two separate containers
+#    (same ones used for manual/dev testing)
 docker compose up -d
 
 # 3. Package the service - the suite launches the real jar, not a mock
@@ -52,9 +53,10 @@ What happens:
   poll cron, its own log level, port `8082` so it won't collide with a `dev`
   instance already running on `8081`, etc.) and waits for the service's own
   startup log line before proceeding.
-- The test opens an SFTP connection, uploads `testdata/sample_input.csv` as
+- The test opens connections to both the input and output SFTP servers,
+  uploads `testdata/sample_input.csv` to the input server as
   `robot_functional_test.csv`, and polls (up to 30s) until the encrypted
-  output shows up.
+  output shows up on the output server.
 - **Suite Teardown** always terminates the launched process, pass or fail.
 
 Results: `target/robot-results/report.html` and `log.html`.

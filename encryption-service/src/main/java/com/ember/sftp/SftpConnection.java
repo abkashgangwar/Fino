@@ -10,18 +10,23 @@ import org.jboss.logging.Logger;
  * transparent reconnect. Not thread-safe by design - {@link SftpObjectService}
  * hands out instances of this one-at-a-time via a blocking queue, which is what
  * keeps concurrent callers from corrupting a shared channel's state.
+ * <p>
+ * Takes a {@link SftpEndpointConfig} rather than a concrete config type, since the
+ * input and output sides are now two independent SFTP servers ({@link SftpInputConfig}
+ * / {@link SftpOutputConfig}) - this class only needs the connection fields they share,
+ * not which side it's connecting to.
  */
 final class SftpConnection {
 
     private static final Logger LOG = Logger.getLogger(SftpConnection.class);
     private static final int TIMEOUT_MS = 10_000;
 
-    private final SftpConfig sftpConfig;
+    private final SftpEndpointConfig endpointConfig;
     private Session session;
     private ChannelSftp channel;
 
-    SftpConnection(SftpConfig sftpConfig) {
-        this.sftpConfig = sftpConfig;
+    SftpConnection(SftpEndpointConfig endpointConfig) {
+        this.endpointConfig = endpointConfig;
     }
 
     /**
@@ -36,12 +41,12 @@ final class SftpConnection {
         closeQuietly(); // clean up any half-open state before reconnecting
 
         JSch jsch = new JSch();
-        if (sftpConfig.privateKeyPath().isPresent()) {
-            jsch.addIdentity(sftpConfig.privateKeyPath().get());
+        if (endpointConfig.privateKeyPath().isPresent()) {
+            jsch.addIdentity(endpointConfig.privateKeyPath().get());
         }
 
-        session = jsch.getSession(sftpConfig.username(), sftpConfig.host(), sftpConfig.port());
-        sftpConfig.password().ifPresent(session::setPassword);
+        session = jsch.getSession(endpointConfig.username(), endpointConfig.host(), endpointConfig.port());
+        endpointConfig.password().ifPresent(session::setPassword);
         // Local/test SFTP server only - a real deployment should pin the host key instead.
         session.setConfig("StrictHostKeyChecking", "no");
         session.connect(TIMEOUT_MS);
@@ -49,9 +54,9 @@ final class SftpConnection {
         channel = (ChannelSftp) session.openChannel("sftp");
         channel.connect(TIMEOUT_MS);
         // Raise JSch's request-pipelining depth above its conservative default (16) -
-        // see SftpConfig.bulkRequests() for why this matters for large-file throughput.
-        channel.setBulkRequests(sftpConfig.bulkRequests());
-        LOG.debug("Opened SFTP session/channel");
+        // see SftpEndpointConfig.bulkRequests() for why this matters for large-file throughput.
+        channel.setBulkRequests(endpointConfig.bulkRequests());
+        LOG.debugf("Opened SFTP session/channel to %s:%d", endpointConfig.host(), endpointConfig.port());
 
         return channel;
     }

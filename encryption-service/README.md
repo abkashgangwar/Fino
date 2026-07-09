@@ -1,9 +1,10 @@
 # Encryption Service
 
-Quarkus (JDK 21) service that watches an **SFTP input directory** for files,
-ZIP-compresses each file into a standalone archive, PGP-encrypts that
-archive (AES-256, integrity packet enabled), and writes the result to an
-**output directory** on the same SFTP server as `<filename>.zip.pgp`.
+Quarkus (JDK 21) service that watches an **SFTP input directory** (on one
+server) for files, ZIP-compresses each file into a standalone archive,
+PGP-encrypts that archive (AES-256, integrity packet enabled), and writes the
+result to an **output directory on a separate SFTP server** as
+`<filename>.zip.pgp`.
 
 ## How it works
 
@@ -122,8 +123,10 @@ src/main/java/com/ember/
 ├── storage/
 │   └── FileStorageService.java     # backend interface (list/download/upload/moveToDone/delete)
 ├── sftp/
-│   ├── SftpConfig.java             # type-safe mapping of sftp.* properties
-│   └── SftpObjectService.java      # FileStorageService impl backed by SFTP (JSch)
+│   ├── SftpEndpointConfig.java     # connection fields shared by both SFTP servers below
+│   ├── SftpInputConfig.java        # type-safe mapping of sftp.input.* properties
+│   ├── SftpOutputConfig.java       # type-safe mapping of sftp.output.* properties
+│   └── SftpObjectService.java      # FileStorageService impl backed by SFTP (JSch) - talks to both servers
 ├── compression/
 │   └── ZipCompressionService.java  # wraps a file into a standalone .zip archive
 ├── encryption/
@@ -139,58 +142,76 @@ connection.
 
 ## SFTP configuration
 
+Input and output are two **independent SFTP servers**, each with its own config
+prefix - this matters when the upstream drop server and the destination server
+for encrypted output are genuinely different machines/vendors, not just
+different directories on the same box.
+
 ```properties
-sftp.host=${SFTP_HOST:localhost}
-sftp.port=${SFTP_PORT:2222}
-sftp.username=${SFTP_USERNAME:testuser}
-sftp.password=${SFTP_PASSWORD:testpass}
-sftp.input-dir=${SFTP_INPUT_DIR:/upload/input}
-sftp.output-dir=${SFTP_OUTPUT_DIR:/upload/output}
-sftp.pool-size=${SFTP_POOL_SIZE:8}
-sftp.bulk-requests=${SFTP_BULK_REQUESTS:64}
+# Server files are picked up FROM
+sftp.input.host=localhost
+sftp.input.port=2222
+sftp.input.username=testuser
+sftp.input.password=testpass
+sftp.input.dir=/upload/input
+sftp.input.pool-size=8
+sftp.input.bulk-requests=64
+
+# Server encrypted output is written TO
+sftp.output.host=localhost
+sftp.output.port=2223
+sftp.output.username=testuser2
+sftp.output.password=testpass2
+sftp.output.dir=/upload/output
+sftp.output.pool-size=8
+sftp.output.bulk-requests=64
 ```
 
-`sftp.pool-size` controls how many concurrent SFTP session/channel pairs are kept
-ready for use - keep it `>= app.processing.parallelism` (see below) so every
-concurrent file-processing worker can always get its own connection.
+`sftp.input.pool-size` / `sftp.output.pool-size` control how many concurrent SFTP
+session/channel pairs are kept ready for use against each server - keep BOTH
+`>= app.processing.parallelism` (see below) so every concurrent file-processing
+worker can always get one connection of each kind.
 
-`sftp.bulk-requests` controls JSch's request-pipelining depth per channel (how
-many SFTP read/write requests can be in flight, unacknowledged, at once). JSch's
-own default is a conservative 16 - fine on localhost, but on any link with real
-round-trip latency that caps large-file transfer throughput well below what the
-link can actually do, since each in-flight slot is what lets the next chunk go
-out before the previous one's ack comes back. 64 here is a reasonable starting
-point for large files at volume; lower it if a particular SFTP server pushes
-back on high concurrency.
+`sftp.input.bulk-requests` / `sftp.output.bulk-requests` control JSch's
+request-pipelining depth per channel (how many SFTP read/write requests can be
+in flight, unacknowledged, at once). JSch's own default is a conservative 16 -
+fine on localhost, but on any link with real round-trip latency that caps
+large-file transfer throughput well below what the link can actually do, since
+each in-flight slot is what lets the next chunk go out before the previous
+one's ack comes back. 64 here is a reasonable starting point for large files at
+volume; lower it if a particular SFTP server pushes back on high concurrency.
 
 ## Processing configuration
 
 ```properties
-app.poll.cron=${APP_POLL_CRON:*/10 * * * * ?}
-app.processing.parallelism=${APP_PROCESSING_PARALLELISM:8}
+app.poll.cron=*/10 * * * * ?
+app.processing.parallelism=8
 ```
 
 `app.processing.parallelism` is how many files are encrypted/uploaded concurrently
-within a single poll cycle. Raise it (together with `sftp.pool-size`) to push
-through a large backlog faster; each worker holds only small fixed-size buffers
-in memory, not full file contents, so raising this scales with CPU/network
-capacity rather than heap.
+within a single poll cycle. Raise it (together with both `sftp.input.pool-size`
+and `sftp.output.pool-size`) to push through a large backlog faster; each worker
+holds only small fixed-size buffers in memory, not full file contents, so
+raising this scales with CPU/network capacity rather than heap.
 
-Defaults above match the local SFTP server in `docker-compose.yml`. For a
-real server, override via env vars (`SFTP_HOST`, `SFTP_PORT`, etc.) or a
-private key instead of a password — `SftpConfig` also supports
-`sftp.private-key-path` for key-based auth.
+Defaults above match the two local SFTP containers in `docker-compose.yml`
+(`sftp-input` on port 2222, `sftp-output` on port 2223). For real servers, just
+edit the values directly - or use a private key instead of a password, via
+`sftp.input.private-key-path` / `sftp.output.private-key-path`
+(`SftpInputConfig` / `SftpOutputConfig` both support this, inherited from the
+shared `SftpEndpointConfig`).
 
-**Tuning for a very large backlog (e.g. 100,000+ files):** the two levers
-that actually move the needle are `app.processing.parallelism` and
-`sftp.pool-size` (always raise them together - the pool must have at least
-as many connections as there are concurrent workers). The defaults (8/8) are
-deliberately conservative so the service is safe out of the box; the right
-higher value depends on your real SFTP server's concurrent-session limit,
-network bandwidth, and available CPU (PGP/AES-256 encryption is CPU-bound).
-There's no single safe number to recommend blindly - raise both gradually
-(e.g. 8 → 16 → 32) while watching CPU, network throughput, and the SFTP
-server's own load, rather than jumping straight to a large value.
+**Tuning for a very large backlog (e.g. 100,000+ files):** the levers that
+actually move the needle are `app.processing.parallelism` and BOTH
+`sftp.input.pool-size` / `sftp.output.pool-size` (always raise all three
+together - each pool must have at least as many connections as there are
+concurrent workers). The defaults (8/8/8) are deliberately conservative so the
+service is safe out of the box; the right higher value depends on your real
+SFTP servers' concurrent-session limits, network bandwidth, and available CPU
+(PGP/AES-256 encryption is CPU-bound). There's no single safe number to
+recommend blindly - raise all three gradually (e.g. 8 → 16 → 32) while watching
+CPU, network throughput, and both SFTP servers' own load, rather than jumping
+straight to a large value.
 
 ## PGP key configuration (never hardcoded)
 
@@ -228,14 +249,15 @@ cp .env.example .env   # .env is gitignored; .env.example is the committed templ
 
 ## Running locally
 
-1. Start the local SFTP server:
+1. Start the local SFTP servers (input + output, two separate containers):
    ```bash
    docker compose up -d
    ```
    This creates `./sftp-data/input` and `./sftp-data/output` on the host,
-   bind-mounted into the SFTP container. The app auto-creates these
-   directories on the SFTP side too (`FileStorageService.initialize()`), so
-   no manual setup is needed there.
+   bind-mounted into the `sftp-input` and `sftp-output` containers
+   respectively. The app auto-creates the matching directories on each SFTP
+   server too (`FileStorageService.initialize()`), so no manual setup is
+   needed there.
 
 2. Copy the env template for the PGP key path:
    ```bash
@@ -303,10 +325,10 @@ to run it.
   error every poll cycle indefinitely.
 - **Public key missing/invalid:** checked once at startup, not per file —
   the whole application fails to start rather than failing per file.
-- **SFTP pool exhausted:** if all `sftp.pool-size` connections are busy for
+- **SFTP pool exhausted:** if all connections in either pool are busy for
   more than 30s, a borrow times out with a clear `IllegalStateException`
-  rather than hanging forever — that file fails and retries next cycle;
-  consider raising `sftp.pool-size` if this happens often.
+  naming which side (input/output) and which property to raise -
+  `sftp.input.pool-size` or `sftp.output.pool-size` - rather than hanging forever.
 
 ## Extending
 

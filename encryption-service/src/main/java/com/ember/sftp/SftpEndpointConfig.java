@@ -1,25 +1,27 @@
 package com.ember.sftp;
 
-import io.smallrye.config.ConfigMapping;
 import io.smallrye.config.WithDefault;
 import io.smallrye.config.WithName;
 
 import java.util.Optional;
 
 /**
- * Config for the SFTP backend - the only file transport this service uses.
- * Defaults below match the local test SFTP server in docker-compose.yml.
+ * Connection fields shared by both SFTP servers this service talks to.
+ * <p>
+ * Deliberately NOT annotated with {@code @ConfigMapping} itself - it exists purely to
+ * be extended by {@link SftpInputConfig} and {@link SftpOutputConfig}, which each apply
+ * their own prefix ("sftp.input" / "sftp.output") and can override any member (e.g. to
+ * give host/port/username different per-server defaults). SmallRye Config supports this
+ * "a config mapping can extend another interface and inherit/override its members"
+ * pattern directly, so the two concrete configs below share this shape without
+ * duplicating every field twice.
  */
-@ConfigMapping(prefix = "sftp")
-public interface SftpConfig {
+public interface SftpEndpointConfig {
 
-    @WithDefault("localhost")
     String host();
 
-    @WithDefault("2222")
     int port();
 
-    @WithDefault("testuser")
     String username();
 
     /** Password auth - fine for local testing. Prefer a private key for anything real. */
@@ -29,25 +31,16 @@ public interface SftpConfig {
     @WithName("private-key-path")
     Optional<String> privateKeyPath();
 
-    /** Directory (as seen by the SFTP client) files are picked up from. */
-    @WithName("input-dir")
-    @WithDefault("/upload/input")
-    String inputDir();
-
-    /** Directory encrypted output is written to. */
-    @WithName("output-dir")
-    @WithDefault("/upload/output")
-    String outputDir();
+    /** Directory (as seen by the SFTP client) this side of the pipeline operates on. */
+    String dir();
 
     /**
-     * Number of concurrent SFTP session/channel pairs kept in the pool.
+     * Number of concurrent SFTP session/channel pairs kept in this server's pool.
      * <p>
-     * Previously the service reused a single shared channel for every operation.
-     * That's fine at low volume, but JSch's ChannelSftp is NOT thread-safe, so once
-     * files were processed in parallel (or two poll cycles overlapped), concurrent
-     * calls on that one channel corrupted its state and blew up the batch. The pool
-     * gives each concurrent worker its own channel, borrowed/returned safely via a
-     * blocking queue - raise this together with app.processing.parallelism.
+     * JSch's ChannelSftp is NOT thread-safe, so concurrent workers each need their own
+     * channel - see {@code SftpObjectService}'s pool for how these are borrowed/returned
+     * safely. Keep both the input and output pool sizes >= app.processing.parallelism so
+     * every concurrent worker can always get one connection of each kind.
      */
     @WithName("pool-size")
     @WithDefault("8")

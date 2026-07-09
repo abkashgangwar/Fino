@@ -23,6 +23,15 @@ import java.util.concurrent.TimeUnit;
 /**
  * SFTP-backed implementation of {@link FileStorageService}.
  * <p>
+ * Talks to TWO INDEPENDENT SFTP SERVERS - {@link SftpInputConfig} for the server files
+ * are picked up from, and {@link SftpOutputConfig} for the (possibly entirely different)
+ * server the encrypted output is written to. This is a deliberate split, not just a
+ * naming convention: different host, port, credentials, even different vendor are all
+ * expected. Every operation below already picked a single pool per direction (see point
+ * 2 below), so plugging in a second real server only meant giving {@link #inputPool} and
+ * {@link #outputPool} their own {@link SftpConnection}s built from their own config,
+ * rather than both being built from one shared config as before.
+ * <p>
  * Supports BOTH pipeline modes off the same connection pools, switched purely by
  * {@code app.processing.streaming-enabled} in {@code FileProcessingService}:
  * <p>
@@ -38,16 +47,15 @@ import java.util.concurrent.TimeUnit;
  *    out of one shared pool would risk deadlock under load: if every worker grabs one
  *    connection first and then blocks waiting for a second, and the pool is exactly
  *    parallelism-sized, every worker can end up holding one and waiting forever for
- *    another. Two independent pools - one only ever used for reading, one only ever
- *    used for writing - make that impossible by construction.
+ *    another. Two independent pools - one only ever used for reading (against the
+ *    input server), one only ever used for writing (against the output server) - make
+ *    that impossible by construction, and now also happen to point at two different
+ *    physical servers.
  *    <p>
  *    The file-based (non-streaming) methods below only ever need ONE connection at a
  *    time each, so they simply pick a pool per operation (inputPool for reads,
  *    outputPool for writes) - reusing the exact same two pools rather than needing a
- *    third pooling strategy for that mode. The only cost of this unification is that
- *    the file-based pipeline now holds 2 * sftp.pool-size idle connections instead of
- *    1 * sftp.pool-size; negligible next to the complexity of maintaining two separate
- *    pooling schemes.
+ *    third pooling strategy for that mode.
  * <p>
  * 3. FILE-TO-FILE STREAMING ({@link #downloadFromInput}/{@link #uploadToProcessed})
  *    for the non-streaming mode, and TRUE END-TO-END STREAMING ({@link #streamProcess})
@@ -56,49 +64,61 @@ import java.util.concurrent.TimeUnit;
  * <p>
  * 4. DONE-FOLDER IDEMPOTENCY instead of a per-file output check. A fully processed
  *    file is renamed (metadata-only, not re-uploaded) into a "done" sub-directory
- *    under the input location via {@link #moveToDone}, so it simply stops appearing
- *    in {@link #listInputObjects}'s (non-recursive) listing.
+ *    under the input location - on the INPUT server, via {@link #moveToDone} - so it
+ *    simply stops appearing in {@link #listInputObjects}'s (non-recursive) listing.
  * <p>
- * Sizing: each pool is sized to sftp.pool-size, so total SFTP connections held open is
- * 2 * sftp.pool-size. Keep sftp.pool-size >= app.processing.parallelism so every
- * concurrent worker can always get one connection of each kind.
+ * Sizing: {@link #inputPool} is sized to {@code sftp.input.pool-size} and
+ * {@link #outputPool} to {@code sftp.output.pool-size} - they no longer have to match.
+ * Keep BOTH >= app.processing.parallelism so every concurrent worker can always get one
+ * connection of each kind.
  */
 @ApplicationScoped
 public class SftpObjectService implements FileStorageService {
 
     private static final Logger LOG = Logger.getLogger(SftpObjectService.class);
     private static final long BORROW_TIMEOUT_SECONDS = 30;
-    /** Sub-directory under sftp.input-dir that fully-processed source files are moved into. */
+    /** Sub-directory under sftp.input.dir (on the input server) that fully-processed source files are moved into. */
     private static final String DONE_SUBDIR = "done";
 
     @Inject
-    SftpConfig sftpConfig;
+    SftpInputConfig inputConfig;
 
-    /** Connections used exclusively for reading (listing, get(), and other metadata ops). */
+    @Inject
+    SftpOutputConfig outputConfig;
+
+    /** Connections used exclusively for reading (listing, get(), and other metadata ops) - all against the input server. */
     private BlockingQueue<SftpConnection> inputPool;
-    /** Connections used exclusively for writing (put(), rename(), rm()). Kept separate from
-     *  inputPool so a streamProcess() call can never deadlock waiting on its own pool - see
-     *  the class-level javadoc above. */
+    /** Connections used exclusively for writing (put(), rename(), rm()) - all against the output server. Kept
+     *  separate from inputPool (and pointed at a different server) so a streamProcess() call can never deadlock
+     *  waiting on its own pool - see the class-level javadoc above. */
     private BlockingQueue<SftpConnection> outputPool;
 
     @PostConstruct
     void initPool() {
-        int size = Math.max(1, sftpConfig.poolSize());
-        inputPool = new LinkedBlockingQueue<>(size);
-        outputPool = new LinkedBlockingQueue<>(size);
-        for (int i = 0; i < size; i++) {
-            inputPool.add(new SftpConnection(sftpConfig));
-            outputPool.add(new SftpConnection(sftpConfig));
+        int inputSize = Math.max(1, inputConfig.poolSize());
+        int outputSize = Math.max(1, outputConfig.poolSize());
+        inputPool = new LinkedBlockingQueue<>(inputSize);
+        outputPool = new LinkedBlockingQueue<>(outputSize);
+        for (int i = 0; i < inputSize; i++) {
+            inputPool.add(new SftpConnection(inputConfig));
         }
-        LOG.infof("SFTP connection pools initialized: %d read + %d write slot(s)", size, size);
+        for (int i = 0; i < outputSize; i++) {
+            outputPool.add(new SftpConnection(outputConfig));
+        }
+        LOG.infof("SFTP connection pools initialized: %d read slot(s) against %s:%d, %d write slot(s) against %s:%d",
+                inputSize, inputConfig.host(), inputConfig.port(),
+                outputSize, outputConfig.host(), outputConfig.port());
     }
 
     @Override
     public void initialize() throws Exception {
         withConnection(inputPool, ch -> {
-            ensureDir(ch, sftpConfig.inputDir());
-            ensureDir(ch, sftpConfig.outputDir());
-            ensureDir(ch, sftpConfig.inputDir() + "/" + DONE_SUBDIR);
+            ensureDir(ch, inputConfig.dir());
+            ensureDir(ch, inputConfig.dir() + "/" + DONE_SUBDIR);
+            return null;
+        });
+        withConnection(outputPool, ch -> {
+            ensureDir(ch, outputConfig.dir());
             return null;
         });
     }
@@ -107,7 +127,7 @@ public class SftpObjectService implements FileStorageService {
     public List<String> listInputObjects() throws Exception {
         return withConnection(inputPool, ch -> {
             List<String> keys = new ArrayList<>();
-            Vector<ChannelSftp.LsEntry> entries = ch.ls(sftpConfig.inputDir());
+            Vector<ChannelSftp.LsEntry> entries = ch.ls(inputConfig.dir());
             for (ChannelSftp.LsEntry entry : entries) {
                 String name = entry.getFilename();
                 if (!entry.getAttrs().isDir() && !name.startsWith(".")) {
@@ -129,7 +149,7 @@ public class SftpObjectService implements FileStorageService {
             // ChannelSftp.fill/_stat) seen under heavy concurrent load against a
             // resource-constrained test SFTP server.
             try (OutputStream out = Files.newOutputStream(destination)) {
-                ch.get(sftpConfig.inputDir() + "/" + key, out);
+                ch.get(inputConfig.dir() + "/" + key, out);
             }
             return null;
         });
@@ -139,15 +159,15 @@ public class SftpObjectService implements FileStorageService {
     public void uploadToProcessed(String key, Path source) throws Exception {
         withConnection(outputPool, ch -> {
             // put(String, String) streams straight from the local file - no in-memory buffer.
-            ch.put(source.toString(), sftpConfig.outputDir() + "/" + key);
+            ch.put(source.toString(), outputConfig.dir() + "/" + key);
             return null;
         });
     }
 
     @Override
     public void streamProcess(String inputKey, String outputKey, StreamTransform transform) throws Exception {
-        String inputPath = sftpConfig.inputDir() + "/" + inputKey;
-        String outputPath = sftpConfig.outputDir() + "/" + outputKey;
+        String inputPath = inputConfig.dir() + "/" + inputKey;
+        String outputPath = outputConfig.dir() + "/" + outputKey;
 
         SftpConnection inConn = borrow(inputPool, "read");
         SftpConnection outConn;
@@ -185,8 +205,8 @@ public class SftpObjectService implements FileStorageService {
     @Override
     public void moveToDone(String key) throws Exception {
         withConnection(inputPool, ch -> {
-            String from = sftpConfig.inputDir() + "/" + key;
-            String to = sftpConfig.inputDir() + "/" + DONE_SUBDIR + "/" + key;
+            String from = inputConfig.dir() + "/" + key;
+            String to = inputConfig.dir() + "/" + DONE_SUBDIR + "/" + key;
             // rename() is a single metadata-only SFTP request (SSH_FXP_RENAME) - no file
             // content is re-transferred, so this is cheap no matter how large the file was.
             ch.rename(from, to);
@@ -196,9 +216,12 @@ public class SftpObjectService implements FileStorageService {
 
     @Override
     public boolean existsInProcessed(String key) throws Exception {
-        return withConnection(inputPool, ch -> {
+        // Checks the OUTPUT server, so this must borrow from outputPool, not inputPool -
+        // now that input/output are two different servers, inputPool's connections simply
+        // can't see anything living on the output server.
+        return withConnection(outputPool, ch -> {
             try {
-                ch.lstat(sftpConfig.outputDir() + "/" + key);
+                ch.lstat(outputConfig.dir() + "/" + key);
                 return true;
             } catch (SftpException e) {
                 if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) {
@@ -212,7 +235,7 @@ public class SftpObjectService implements FileStorageService {
     @Override
     public void deleteFromInput(String key) throws Exception {
         withConnection(inputPool, ch -> {
-            ch.rm(sftpConfig.inputDir() + "/" + key);
+            ch.rm(inputConfig.dir() + "/" + key);
             return null;
         });
     }
@@ -261,9 +284,12 @@ public class SftpObjectService implements FileStorageService {
     private SftpConnection borrow(BlockingQueue<SftpConnection> pool, String kind) throws InterruptedException {
         SftpConnection conn = pool.poll(BORROW_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         if (conn == null) {
+            boolean isInput = pool == inputPool;
+            int size = isInput ? inputConfig.poolSize() : outputConfig.poolSize();
+            String property = isInput ? "sftp.input.pool-size" : "sftp.output.pool-size";
             throw new IllegalStateException(
                     "Timed out waiting for a free SFTP " + kind + " connection (all "
-                            + sftpConfig.poolSize() + " in use). Consider raising sftp.pool-size.");
+                            + size + " in use). Consider raising " + property + ".");
         }
         return conn;
     }

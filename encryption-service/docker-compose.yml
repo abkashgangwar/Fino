@@ -1,16 +1,26 @@
 version: "3.8"
 
 services:
-  # Local SFTP server. Login: testuser / testpass on port 2222.
-  # Chroot root is /home/testuser, so paths as seen by the app are /upload/input
-  # and /upload/output - matching the sftp.input-dir / sftp.output-dir defaults
-  # in application.properties.
-  sftp:
+  # Local INPUT SFTP server. Login: testuser / testpass on port 2222.
+  # Chroot root is /home/testuser, so the path as seen by the app is /upload/input -
+  # matching the sftp.input.dir default in application.properties.
+  sftp-input:
     image: atmoz/sftp:latest
-    container_name: encryption-sftp
+    container_name: encryption-sftp-input
     ports:
       - "2222:22"
     volumes:
       - ./sftp-data/input:/home/testuser/upload/input
-      - ./sftp-data/output:/home/testuser/upload/output
     command: testuser:testpass:1000:1000:upload
+
+  # Local OUTPUT SFTP server - a SEPARATE container/server from the input one above,
+  # with its own port and credentials, matching sftp.output.* defaults in
+  # application.properties. Login: testuser2 / testpass2 on port 2223.
+  sftp-output:
+    image: atmoz/sftp:latest
+    container_name: encryption-sftp-output
+    ports:
+      - "2223:22"
+    volumes:
+      - ./sftp-data/output:/home/testuser2/upload/output
+    command: testuser2:testpass2:1000:1000:upload

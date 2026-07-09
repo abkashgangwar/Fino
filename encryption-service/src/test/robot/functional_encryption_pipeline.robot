@@ -10,7 +10,8 @@ Documentation     Functional (black-box) test for ember-encryption-service.
 ...               directory, and the original is relocated into input/done/.
 ...
 ...               Prerequisites (see src/test/robot/README.md for full setup):
-...                 1) The local test SFTP server is running: docker compose up -d
+...                 1) Both local test SFTP servers (input + output) are running:
+...                    docker compose up -d
 ...                 2) The service is packaged: mvn package -DskipTests
 ...
 Resource          resources/common.resource
@@ -33,7 +34,7 @@ File Dropped In SFTP Input Is Encrypted And Delivered To Output
     ...    <name>.zip.pgp - with the original source moved into input/done/.
     ${test_base_name} =    Generate Unique Test Base Name
 
-    SSHLibrary.Put File    ${LOCAL_TEST_FILE}    ${SFTP_INPUT_DIR}/${test_base_name}
+    Drop File In Sftp Input    ${LOCAL_TEST_FILE}    ${test_base_name}
 
     Wait Until Keyword Succeeds    ${PROCESSING_TIMEOUT}    ${PROCESSING_POLL}
     ...    Output File Should Exist And Be Non Empty    ${test_base_name}

@@ -11,14 +11,26 @@ Library           Collections
 
 
 *** Variables ***
-# ---------- SFTP (local docker-compose test server - see docker-compose.yml) ----------
-${SFTP_HOST}              localhost
-${SFTP_PORT}              2222
-${SFTP_USERNAME}          testuser
-${SFTP_PASSWORD}          testpass
+# ---------- SFTP input server (local docker-compose "sftp-input" container - see docker-compose.yml) ----------
+${SFTP_INPUT_HOST}        localhost
+${SFTP_INPUT_PORT}        2222
+${SFTP_INPUT_USERNAME}    testuser
+${SFTP_INPUT_PASSWORD}    testpass
 ${SFTP_INPUT_DIR}         /upload/input
-${SFTP_OUTPUT_DIR}        /upload/output
 ${SFTP_DONE_DIR}          /upload/input/done
+
+# ---------- SFTP output server - a SEPARATE container ("sftp-output") from the input
+# one above, its own port/credentials - see docker-compose.yml ----------
+${SFTP_OUTPUT_HOST}       localhost
+${SFTP_OUTPUT_PORT}       2223
+${SFTP_OUTPUT_USERNAME}   testuser2
+${SFTP_OUTPUT_PASSWORD}   testpass2
+${SFTP_OUTPUT_DIR}        /upload/output
+
+# Connection aliases used with SSHLibrary.Switch Connection below, since the suite now
+# has to juggle two live SFTP connections instead of one.
+${INPUT_SFTP_ALIAS}       input-sftp
+${OUTPUT_SFTP_ALIAS}      output-sftp
 
 # ---------- Service under test ----------
 # Repo root, resolved relative to this resource file (src/test/robot/resources/../../../..)
@@ -69,11 +81,23 @@ Stop Encryption Service
     Log    Stop Encryption Service result: ${result}
 
 Open Test Sftp Connection
-    SSHLibrary.Open Connection    ${SFTP_HOST}    port=${SFTP_PORT}
-    SSHLibrary.Login    ${SFTP_USERNAME}    ${SFTP_PASSWORD}
+    [Documentation]    Opens ONE connection per server (input and output are now two
+    ...    separate SFTP servers) under distinct aliases, so later keywords can
+    ...    Switch Connection to whichever side they need to talk to.
+    SSHLibrary.Open Connection    ${SFTP_INPUT_HOST}    port=${SFTP_INPUT_PORT}    alias=${INPUT_SFTP_ALIAS}
+    SSHLibrary.Login    ${SFTP_INPUT_USERNAME}    ${SFTP_INPUT_PASSWORD}
+    SSHLibrary.Open Connection    ${SFTP_OUTPUT_HOST}    port=${SFTP_OUTPUT_PORT}    alias=${OUTPUT_SFTP_ALIAS}
+    SSHLibrary.Login    ${SFTP_OUTPUT_USERNAME}    ${SFTP_OUTPUT_PASSWORD}
 
 Close Test Sftp Connection
-    Run Keyword And Ignore Error    SSHLibrary.Close Connection
+    Run Keyword And Ignore Error    SSHLibrary.Close All Connections
+
+Drop File In Sftp Input
+    [Documentation]    Uploads a local file into the INPUT server's input directory.
+    ...    Hides the connection-switching detail from the test suite itself.
+    [Arguments]    ${local_path}    ${remote_name}
+    SSHLibrary.Switch Connection    ${INPUT_SFTP_ALIAS}
+    SSHLibrary.Put File    ${local_path}    ${SFTP_INPUT_DIR}/${remote_name}
 
 Generate Unique Test Base Name
     [Documentation]    The local test SFTP server (atmoz/sftp) is locked down to
@@ -91,6 +115,7 @@ Output File Should Exist And Be Non Empty
     ...    to check its size, since the server has no "stat"/exec access and
     ...    SSHLibrary itself has no remote file-size keyword.
     [Arguments]    ${base_name}
+    SSHLibrary.Switch Connection    ${OUTPUT_SFTP_ALIAS}
     ${files} =    SSHLibrary.List Files In Directory    ${SFTP_OUTPUT_DIR}    pattern=${base_name}.zip.pgp
     Should Not Be Empty    ${files}
     ...    msg=${base_name}.zip.pgp has not appeared in ${SFTP_OUTPUT_DIR} yet.
@@ -106,6 +131,7 @@ Source File Should Be Moved To Done
     [Documentation]    Confirms FileStorageService.moveToDone relocated the
     ...    original source file - pure SFTP listing, no exec needed.
     [Arguments]    ${base_name}
+    SSHLibrary.Switch Connection    ${INPUT_SFTP_ALIAS}
     ${done_files} =    SSHLibrary.List Files In Directory    ${SFTP_DONE_DIR}    pattern=${base_name}
     Should Not Be Empty    ${done_files}
     ...    msg=${base_name} was encrypted but the source was not moved to ${SFTP_DONE_DIR}.
