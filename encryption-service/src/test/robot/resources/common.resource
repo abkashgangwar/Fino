@@ -50,6 +50,10 @@ ${SERVICE_STARTUP_POLL}       2s
 ${PROCESSING_TIMEOUT}     30s
 ${PROCESSING_POLL}        2s
 
+# Used by negative-case tests that assert something never happens - long enough to
+# cover several %test. poll cycles (2s each) so a pass can't just be bad timing.
+${NEGATIVE_CASE_OBSERVATION_WINDOW}    20s
+
 
 *** Keywords ***
 Start Encryption Service With Test Profile
@@ -135,3 +139,68 @@ Source File Should Be Moved To Done
     ${done_files} =    SSHLibrary.List Files In Directory    ${SFTP_DONE_DIR}    pattern=${base_name}
     Should Not Be Empty    ${done_files}
     ...    msg=${base_name} was encrypted but the source was not moved to ${SFTP_DONE_DIR}.
+
+Generate Unique Test Base Name With Extension
+    [Documentation]    Same uniqueness strategy as Generate Unique Test Base Name,
+    ...    but with a caller-supplied extension instead of a hardcoded .csv - used
+    ...    by edge-case tests that need a non-CSV file (e.g. a binary fixture).
+    [Arguments]    ${extension}
+    ${timestamp} =    Evaluate    str(int(time.time()))    modules=time
+    RETURN    robot_functional_test_${timestamp}.${extension}
+
+Create Local Empty Test File
+    [Documentation]    Creates a genuinely 0-byte local file - used by the empty-file
+    ...    edge case to prove the pipeline doesn't special-case (or choke on) empty
+    ...    input.
+    ${path} =    Set Variable    ${SERVICE_LOG_DIR}${/}empty_test_input.csv
+    OperatingSystem.Create File    ${path}    content=${EMPTY}
+    RETURN    ${path}
+
+Create Local Binary Test File
+    [Documentation]    Creates a small local file covering the full 0-255 byte range
+    ...    (including NUL bytes) - used by the binary-file edge case to prove the
+    ...    pipeline treats every file as an opaque byte stream and never assumes
+    ...    text/CSV content.
+    ${path} =    Set Variable    ${SERVICE_LOG_DIR}${/}binary_test_input.bin
+    ${payload} =    Evaluate    bytes(range(0, 256)) * 4
+    OperatingSystem.Create Binary File    ${path}    ${payload}
+    RETURN    ${path}
+
+Put File In Sftp Input Done Directory
+    [Documentation]    Uploads straight into input/done/ - bypassing the normal
+    ...    input root and moveToDone flow entirely. Used by the negative test that
+    ...    proves listInputObjects() is non-recursive: a file already sitting in
+    ...    done/ must never be picked up as new pending work.
+    [Arguments]    ${local_path}    ${remote_name}
+    SSHLibrary.Switch Connection    ${INPUT_SFTP_ALIAS}
+    SSHLibrary.Put File    ${local_path}    ${SFTP_DONE_DIR}/${remote_name}
+
+Output File Should Not Exist
+    [Documentation]    Point-in-time (no retry) check that no encrypted output has
+    ...    appeared for this base name. Only meaningful after waiting out at least
+    ...    ${NEGATIVE_CASE_OBSERVATION_WINDOW} first - this asserts a durable
+    ...    absence, not a "hasn't happened yet (yet)" snapshot.
+    [Arguments]    ${base_name}
+    SSHLibrary.Switch Connection    ${OUTPUT_SFTP_ALIAS}
+    ${files} =    SSHLibrary.List Files In Directory    ${SFTP_OUTPUT_DIR}    pattern=${base_name}*
+    Should Be Empty    ${files}
+    ...    msg=${base_name}* unexpectedly appeared in ${SFTP_OUTPUT_DIR} - it should never have been processed.
+
+Source File Should Still Be In Input Root
+    [Documentation]    Confirms a file was left completely untouched at the top
+    ...    level of the input directory - never relocated into done/, proving it
+    ...    was invisible to the poller (used by the hidden dot-file negative case).
+    [Arguments]    ${remote_name}
+    SSHLibrary.Switch Connection    ${INPUT_SFTP_ALIAS}
+    ${files} =    SSHLibrary.List Files In Directory    ${SFTP_INPUT_DIR}    pattern=${remote_name}
+    Should Not Be Empty    ${files}
+    ...    msg=${remote_name} is missing from ${SFTP_INPUT_DIR} - it should have been left untouched.
+
+Count Matching Files In Sftp Directory
+    [Documentation]    Generic helper for idempotency checks - switches to the given
+    ...    connection alias and returns how many entries in ${dir} match ${pattern}.
+    [Arguments]    ${alias}    ${dir}    ${pattern}
+    SSHLibrary.Switch Connection    ${alias}
+    ${files} =    SSHLibrary.List Files In Directory    ${dir}    pattern=${pattern}
+    ${count} =    Get Length    ${files}
+    RETURN    ${count}

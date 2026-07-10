@@ -61,6 +61,27 @@ What happens:
 
 Results: `target/robot-results/report.html` and `log.html`.
 
+## Test cases
+
+- **Happy path**: `File Dropped In SFTP Input Is Encrypted And Delivered To Output`
+- **Edge cases** (tag `edge-case`): empty (0-byte) file, filename with spaces/special
+  characters, and a binary (non-text) file - all proving the pipeline doesn't
+  special-case size, filename shape, or content type.
+- **Negative cases** (tag `negative`): a hidden dot-prefixed file is never picked up,
+  a file dropped straight into `input/done/` is never treated as new work, and an
+  already-processed file is never reprocessed on a later poll.
+
+Run only one group with `--include`:
+
+```bash
+robot --outputdir target/robot-results --include edge-case src/test/robot/functional_encryption_pipeline.robot
+robot --outputdir target/robot-results --include negative src/test/robot/functional_encryption_pipeline.robot
+```
+
+Note: the negative-case tests each include a `Sleep    ${NEGATIVE_CASE_OBSERVATION_WINDOW}`
+(20s) to give several real `%test.` poll cycles (2s cron) a chance to run before
+asserting absence - so the full suite now takes noticeably longer than before.
+
 ## Notes
 
 - The suite is idempotent - it removes any leftover files from a previous run
